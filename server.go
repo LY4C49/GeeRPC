@@ -4,12 +4,14 @@ import (
 	"GeeRPC/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 通信协议
@@ -33,11 +35,15 @@ const MagicNumber = 0x3bef5c
 type Option struct {
 	MagicNumber int        // MN marks this is a geerpc request
 	CodecType   codec.Type // client may choose different Codec to encode body
+
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 // Server represents an RPC Server.
@@ -119,7 +125,7 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 	}
 	// f(conn) 返回对应编码类型的Codec实例化对象，例如 gob 返回 GobCodec （它实现了 readBody, readHeader, Write, Close方法）
 	// 将来实现json的JSONCodec即可处理json
-	server.serverCodec(f(conn)) // CodecFuncMap keeps the constructor and return an instantiation corresponding Codec object
+	server.serverCodec(f(conn), &opt) // CodecFuncMap keeps the constructor and return an instantiation corresponding Codec object
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
@@ -143,7 +149,7 @@ handleRequest 使用了协程并发执行请求。
 尽力而为，只有在 header 解析失败时，才终止循环。
 */
 
-func (server *Server) serverCodec(cc codec.Codec) {
+func (server *Server) serverCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -157,7 +163,7 @@ func (server *Server) serverCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -221,21 +227,39 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
-	//log.Println("handleRequest: ", req.h, req.argv.Elem()) //Elem returns the value that the interface v contains or that the pointer v points to.
-	//req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	called := make(chan struct{})
+	sent := make(chan struct{})
 
-	//相对于 readRequest，handleRequest 的实现非常简单，通过 req.svc.call 完成方法调用，将 replyv 传递给 sendResponse 完成序列化即可。
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
+		return
 	}
 
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	//called 信道接收到消息，代表处理没有超时，继续执行 sendResponse。
+	//time.After() 先于 called 接收到消息，说明处理已经超时，called 和 sent 都将被阻塞。在 case <-time.After(timeout) 处调用 sendResponse。
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent // 阻塞至发送完成
+	}
 }
 
 // Accept accepts connections on the listener and serves requests

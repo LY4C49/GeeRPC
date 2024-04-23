@@ -2,6 +2,7 @@ package GeeRPC
 
 import (
 	"GeeRPC/codec"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type Call struct {
@@ -182,26 +184,53 @@ func parseOptions(opts ...*Option) (*Option, error) {
 }
 
 // 提供给用户的调用接口，初始化一个客户端
-func Dial(network string, address string, opts ...*Option) (client *Client, err error) {
-	// parse options
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+// 以下代码是防止客户端创建连接超时，
+// 除此之外还有Client.Call超时，服务端超时等
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-
-	// set up connection
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-
+	// close the connection if client is nil
 	defer func() {
-		if client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
 
-	return NewClient(conn, opt)
+	/*
+		使用子协程执行 NewClient，执行完成后则通过信道 ch 发送结果，如果 time.After() 信道先接收到消息，则说明 NewClient 执行超时，返回错误。
+	*/
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+func Dial(network string, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 
 }
 
@@ -257,8 +286,22 @@ func (client *Client) Go(method string, args interface{}, replyv interface{}, do
 	return call
 }
 
-func (client *Client) Call(method string, args interface{}, replyv interface{}) error {
-	call := <-client.Go(method, args, replyv, make(chan *Call, 1)).Done // Done是call中的一个管道，当没有完成时，会阻塞在此等待，实现一个同步的Call方法
+// 防止client.Call超时
+// 使用 context 包实现，控制权交给用户，控制更为灵活。
+/*
+用户可以使用 context.WithTimeout 创建具备超时检测能力的 context 对象来控制。例如：
+	ctx, _ := context.WithTimeout(context.Background(), time.Second)
+	var reply int
+	err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+*/
+func (client *Client) Call(ctx context.Context, method string, args interface{}, replyv interface{}) error {
+	call := client.Go(method, args, replyv, make(chan *Call, 1))
 	// 当call完成时，会调用 call.done() 将自身这个call写入这个管道！
-	return call.Error
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed" + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
