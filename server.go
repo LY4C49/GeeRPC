@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -265,3 +266,53 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection.
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
+
+// === Add Support to HTTP - server side ===
+
+/*
+通信过程应该是这样的：
+
+1. 客户端向 RPC 服务器发送 CONNECT 请求
+CONNECT 10.0.0.1:9999/_geerpc_ HTTP/1.0
+
+2.RPC 服务器返回 HTTP 200 状态码表示连接建立。
+HTTP/1.0 200 Connected to Gee RPC
+
+3.客户端使用创建好的连接发送 RPC 报文，先发送 Option，再发送 N 个请求报文，服务端处理 RPC 请求并响应。
+*/
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geerpc_"
+	defaultDebugPath = "/debug/geerpc"
+)
+
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	//Hijack lets the caller take over the connection. After a call to Hijack the HTTP server library will not do anything else with the connection.
+	//It becomes the caller's responsibility to manage and close the connection.
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n") // 服务器回应
+	server.ServerConn(conn)
+}
+
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
